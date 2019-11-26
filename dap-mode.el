@@ -238,7 +238,7 @@ SUCCESS-CALLBACK will be called if it is provided and if the call
 has succeeded."
   (-lambda ((result &as &hash "success" "message"))
     (if success
-        (when success-callback (funcall  success-callback result))
+        (when success-callback (funcall success-callback result))
       (error message))))
 
 (defun dap--session-init-resp-handler (debug-session &optional success-callback)
@@ -576,25 +576,24 @@ thread exection but the server will log message."
         (dap--debug-session-thread-id debug-session) nil)
   (run-hook-with-args 'dap-continue-hook debug-session))
 
-(defun dap-continue ()
+(defun dap-continue (debug-session thread-id)
   "Call continue for the currently active session and thread."
-  (interactive)
-  (let* ((debug-session (dap--cur-active-session-or-die))
-         (thread-id (dap--debug-session-thread-id debug-session)))
-    (dap--send-message (dap--make-request "continue"
-                                          (list :threadId thread-id))
-                       (dap--resp-handler)
-                       debug-session)
-    (dap--resume-application debug-session)))
+  (interactive (list (dap--cur-active-session-or-die)
+                     (dap--debug-session-thread-id (dap--cur-active-session-or-die))))
+  (dap--send-message (dap--make-request "continue"
+                                        (list :threadId thread-id))
+                     (dap--resp-handler)
+                     debug-session)
+  (dap--resume-application debug-session))
 
-(defun dap-disconnect ()
+(defun dap-disconnect (session)
   "Disconnect from the currently active session."
-  (interactive)
+  (interactive (list (dap--cur-active-session-or-die)))
   (dap--send-message (dap--make-request "disconnect"
                                         (list :restart :json-false))
                      (dap--resp-handler)
-                     (dap--cur-active-session-or-die))
-  (dap--resume-application (dap--cur-active-session-or-die)))
+                     session)
+  (dap--resume-application session))
 
 (defun dap-next ()
   "Debug next."
@@ -793,13 +792,12 @@ thread exection but the server will log message."
                            (when body (gethash "threads" body)))
                      (run-hooks 'dap-session-changed-hook))
                    debug-session)))
-      ("exited" (with-current-buffer (dap--debug-session-output-buffer debug-session)
-                  ;; (insert (gethash "body" (gethash "body" event)))
-                  ))
+      ("exited" (dap--mark-session-as-terminated debug-session))
       ("stopped"
        (-let [(&hash "threadId" thread-id "type" reason) body]
          (puthash thread-id reason (dap--debug-session-thread-states debug-session))
-         (dap--select-thread-id debug-session thread-id)))
+         (dap--select-thread-id debug-session thread-id)
+         (run-hooks 'dap-session-changed-hook)))
       ("terminated"
        (dap--mark-session-as-terminated debug-session))
       ("usernotification"
@@ -887,6 +885,22 @@ ADAPTER-ID the id of the adapter."
         (process-send-string (dap--debug-session-proc debug-session)
                              (dap--make-message message)))
     (error "Session %s is already terminated" (dap--debug-session-name debug-session))))
+
+(defun dap-request (session method &rest args)
+  "Sync request."
+  (let (result)
+    (dap--send-message
+     (dap--make-request method args)
+     (lambda (res) (setf result (or res :finished)))
+     session)
+
+    (while (not result)
+      (accept-process-output nil 0.001))
+
+    (cond
+     ((eq result :finished) nil)
+     ((and (ht? result) (not (gethash "success" result))) (error (gethash "message" result)))
+     (t (gethash "body" result)))))
 
 (defun dap--create-session (launch-args)
   "Create debug session from LAUNCH-ARGS."
@@ -1169,6 +1183,14 @@ before starting the debug process."
          (dap--select-thread-id debug-session thread-id t)))
      debug-session)))
 
+(defun dap-stop-thread-1 (debug-session thread-id)
+  (dap--send-message
+   (dap--make-request
+    "pause"
+    (list :threadId thread-id))
+   (dap--resp-handler)
+   debug-session))
+
 (defun dap-stop-thread ()
   "Stop selected thread."
   (interactive)
@@ -1181,12 +1203,7 @@ before starting the debug process."
                                       "Select active thread: "
                                       threads
                                       (apply-partially 'gethash "name"))]
-         (dap--send-message
-          (dap--make-request
-           "pause"
-           (list :threadId thread-id))
-          (dap--resp-handler)
-          debug-session)))
+         (dap-stop-thread-1 debug-session thread-id)))
      debug-session)))
 
 (defun dap--switch-to-session (new-session)
@@ -1357,7 +1374,8 @@ If the current session it will be terminated."
                        (when (eq (dap--cur-session) debug-session)
                          (dap--switch-to-session nil))
                        (-when-let (buffer (dap--debug-session-output-buffer debug-session))
-                         (kill-buffer buffer)))))
+                         (kill-buffer buffer))
+                       (dap--refresh-breakpoints))))
     (if (not (dap--session-running debug-session))
         (funcall cleanup-fn)
       (dap--send-message (dap--make-request "disconnect"
@@ -1379,7 +1397,8 @@ If the current session it will be terminated."
         (error))))
 
   (dap--set-sessions ())
-  (dap--switch-to-session nil))
+  (dap--switch-to-session nil)
+  (dap--refresh-breakpoints))
 
 (defun dap-breakpoint-delete-all ()
   "Delete all breakpoints."
